@@ -761,6 +761,16 @@ static void UpdateLayered(HWND hwnd)
         return &normal;
     };
 
+    // Text drop-shadow: 8-direction 1px offset in semi-opaque black, simulating
+    // a soft 1px shadow without real blur. Applied to every line via the
+    // drawWithShadow lambda below so the floating overlay reads cleanly against
+    // light backgrounds (HWiNFO/Task Manager panels, etc.). Shadow alpha is
+    // fixed (180/255) — independent of fgAlpha/opacity slider because a half-
+    // transparent shadow is hard to see, and the overlay already has bgAlpha
+    // for global transparency control.
+    const Gdiplus::Color shadowColor(180, 0, 0, 0);
+    Gdiplus::SolidBrush shadow(shadowColor);
+
     WCHAR lineBuf[256];
     int  lh = g_cfg.fontSize + 6;
     int  widthPx = 200, heightPx = 6;
@@ -854,6 +864,34 @@ static void UpdateLayered(HWND hwnd)
     g.FillRectangle(&clear, (Gdiplus::REAL)0, (Gdiplus::REAL)0,
                     (Gdiplus::REAL)widthPx, (Gdiplus::REAL)heightPx);
 
+    // yy declared early so drawWithShadow (below) can capture it. C++ lambdas
+    // resolve capture-list names at the point of lambda definition, so the
+    // captured variable must already be in scope. We declare yy before the
+    // lambda, then initialize it to 6 just before the draw loop.
+    int yy = 6;
+
+    // drawWithShadow: render a line of text at the current yy position with
+    // an 8-direction 1px black drop-shadow. Captures `g`, `&shadow`, `&font`,
+    // `yy` (by reference so updates between DrawString calls propagate), and
+    // `widthPx`/`heightPx` for layout consistency. Center (0,0) is skipped
+    // during the shadow pass — that's the foreground position.
+    auto drawWithShadow = [&](const WCHAR* s, Gdiplus::Brush* brush) {
+        if (!s || !*s) return;
+        const Gdiplus::REAL x0 = (Gdiplus::REAL)10;
+        const Gdiplus::REAL yp = (Gdiplus::REAL)yy;
+        // 8-direction shadow pass (corners + edges, excluding center).
+        g.DrawString(s, -1, &font, Gdiplus::PointF(x0 - 1, yp - 1), &shadow);
+        g.DrawString(s, -1, &font, Gdiplus::PointF(x0,     yp - 1), &shadow);
+        g.DrawString(s, -1, &font, Gdiplus::PointF(x0 + 1, yp - 1), &shadow);
+        g.DrawString(s, -1, &font, Gdiplus::PointF(x0 - 1, yp),     &shadow);
+        g.DrawString(s, -1, &font, Gdiplus::PointF(x0 + 1, yp),     &shadow);
+        g.DrawString(s, -1, &font, Gdiplus::PointF(x0 - 1, yp + 1), &shadow);
+        g.DrawString(s, -1, &font, Gdiplus::PointF(x0,     yp + 1), &shadow);
+        g.DrawString(s, -1, &font, Gdiplus::PointF(x0 + 1, yp + 1), &shadow);
+        // Foreground pass at exact center.
+        g.DrawString(s, -1, &font, Gdiplus::PointF(x0, yp), brush);
+    };
+
     // Background fill. transparentBg=TRUE means "no fill at all" (a clean alpha
 // rectangle). When the user is hovering and we want a strong "you can click
 // here" cue, we override and FORCE a fill (and a border), regardless of
@@ -884,10 +922,11 @@ static void UpdateLayered(HWND hwnd)
     }
 }
 
-    int yy = 6;
+    // (yy already declared before drawWithShadow lambda above — captured by
+    //  reference; draw loop below just updates it with +=lh.)
     if (g_cfg.showCpu) {
         StringCchPrintfW(lineBuf, 256, L"%s: %s", g_cpuName, g_cpuTempStr);
-        g.DrawString(lineBuf, -1, &font, Gdiplus::PointF(10, (Gdiplus::REAL)yy), tempBrush(g_flashCpuOn));
+        drawWithShadow(lineBuf, tempBrush(g_flashCpuOn));
         yy += lh;
     }
     // ---- GPU set rendering (mirrors the measurement loop above) ----
@@ -897,29 +936,29 @@ static void UpdateLayered(HWND hwnd)
             if (!entry->showInPanel) continue;
             // Name line (no flash on names — temp is the alerted field)
             StringCchPrintfW(lineBuf, 256, L"%s", entry->name);
-            g.DrawString(lineBuf, -1, &font, Gdiplus::PointF(10, (Gdiplus::REAL)yy), &fg);
+            drawWithShadow(lineBuf, &fg);
             yy += lh;
             // Temp line (flash honored — any GPU over threshold triggers)
             StringCchPrintfW(lineBuf, 256, L"  Temp: %s", entry->tempStr);
-            g.DrawString(lineBuf, -1, &font, Gdiplus::PointF(10, (Gdiplus::REAL)yy), tempBrush(g_flashGpuOn));
+            drawWithShadow(lineBuf, tempBrush(g_flashGpuOn));
             yy += lh;
             // Usage
             if (g_cfg.showUsage) {
                 StringCchPrintfW(lineBuf, 256, L"  Usage: %s", entry->usageStr);
-                g.DrawString(lineBuf, -1, &font, Gdiplus::PointF(10, (Gdiplus::REAL)yy), &fg);
+                drawWithShadow(lineBuf, &fg);
                 yy += lh;
             }
             // VRAM
             if (g_cfg.showVram) {
                 StringCchPrintfW(lineBuf, 256, L"  VRAM: %s", entry->vramStr);
-                g.DrawString(lineBuf, -1, &font, Gdiplus::PointF(10, (Gdiplus::REAL)yy), &fg);
+                drawWithShadow(lineBuf, &fg);
                 yy += lh;
             }
         }
     }
     if (g_cfg.showRam) {
         StringCchPrintfW(lineBuf, 256, L"RAM: %s", g_ramStr);
-        g.DrawString(lineBuf, -1, &font, Gdiplus::PointF(10, (Gdiplus::REAL)yy), &fg);
+        drawWithShadow(lineBuf, &fg);
         yy += lh;
     }
     // showUsage's old single line ("CPU X / GPU Y") is dropped — see measurement section.
