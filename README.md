@@ -1,52 +1,45 @@
 # viewTemp
 
-Tiny Windows overlay that shows CPU/GPU temperature, usage, VRAM and system
-RAM in a top-right always-on-top window. Reads sensor data from the
-[MSI Afterburner Hardware Monitoring](https://www.msi.com/Landing/afterburner)
-shared memory block — viewTemp itself does not access any hardware directly.
+一个轻量 Windows 悬浮窗，在屏幕右上角常驻置顶，显示 CPU / GPU 温度、
+使用率、显存和系统内存。传感器数据来自
+[MSI Afterburner 硬件监控](https://www.msi.com/Landing/afterburner) 的
+共享内存块 —— viewTemp 本身不直接访问任何硬件。
 
-## Features
+## 功能
 
-- CPU/GPU temperature, usage, VRAM (used / total / percent), system RAM
-- Threshold-based flashing alert (per-row 360 ms heartbeat on threshold breach)
-- ini-based hardware database: CPU/GPU model matched at startup to pick
-  sensible temperature thresholds automatically
-- Position persistence, hot-reload of ini settings, top-most transparent
-  overlay with hover-fade-in interactivity
-- UI language auto-detected from the Windows user UI language at startup
-  (Chinese / English supported — add more in `LANG_IF` calls)
+- CPU / GPU 温度、使用率、显存（已用 / 总量 / 百分比）、系统内存
+- 阈值闪烁告警（每行 360 ms 心跳节奏，跨阈值触发）
+- ini 驱动硬件库：启动时匹配 CPU / GPU 型号，自动选择合理温度阈值
+- 窗口位置持久化、ini 设置热重载、置顶透明悬浮窗、悬停淡入交互
+- 启动时按 Windows 用户界面语言自动识别 UI 文案（中 / 英已支持，新增语言请加 `LANG_IF`）
 
-## Build
+## 编译
 
-Requires Visual Studio 2019/2022 with the C++ desktop workload and the
-Windows 10+ SDK.
+需要 Visual Studio 2019 / 2022 附带 C++ 桌面工作负载和 Windows 10+ SDK。
 
 ```cmd
 build.bat
 ```
 
-Output: `viewTemp.exe` (single self-contained binary, no DLLs to ship).
+产物：`viewTemp.exe`（单文件自包含二进制，无需额外 DLL）。
 
-## Run
+## 运行
 
-Start **MSI Afterburner** (with RivaTuner Statistics Server) first — viewTemp
-reads sensor data from its shared memory block. Without Afterburner running,
-only the system RAM and (read) VRAM total fields will populate; temperature
-and usage will show `--`.
+先启动 **MSI Afterburner**（含 RivaTuner Statistics Server）—— viewTemp 从
+其共享内存读传感器数据。未启动 Afterburner 时，只有系统内存和（只读）
+显存总量字段会填充，温度和使用率显示 `--`。
 
-## Configuration
+## 配置
 
-A `viewTemp.ini` file is created next to the executable on first run. It
-holds the persistent window position, display flags, and the `[threshold]`
-section with per-CPU/GPU alert thresholds. Edit it freely — changes are
-picked up within ~1 second without restarting.
+首次运行会在 exe 同目录生成 `viewTemp.ini`。包含窗口位置持久化、显示
+开关和 `[threshold]` 段的 CPU / GPU 告警阈值。可自由编辑 —— 修改后约
+1 秒内自动热重载，无需重启。
 
-## Known issues
+## 已知问题
 
-See [KNOWN_ISSUES.md](KNOWN_ISSUES.md) for runtime requirements
-(MSI Afterburner must be running), VRAM total caveats, and intentional
-limitations.
+见 [KNOWN_ISSUES.md](KNOWN_ISSUES.md)：运行依赖（必须开启 Afterburner）、
+显存总量限制、有意为之的取舍。
 
-## License
+## 协议
 
-MIT — see [LICENSE](LICENSE).
+MIT —— 见 [LICENSE](LICENSE)。
