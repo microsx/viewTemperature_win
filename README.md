@@ -1,5 +1,7 @@
 # viewTemp
 
+> [English version](README_en.md)
+
 一个轻量 Windows 悬浮窗，在屏幕右上角常驻置顶，显示 CPU / GPU 温度、
 使用率、显存和系统内存。传感器数据来自
 [MSI Afterburner 硬件监控](https://www.msi.com/Landing/afterburner) 的
