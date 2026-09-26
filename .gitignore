@@ -6,9 +6,17 @@ build/
 *.pch
 *.exe
 
+# Exception: release artifacts ARE committed (zip + per-version exe + sha256).
+# Only the dev build tree is excluded; users download the released binary
+# straight from the GitHub repo.
+!release/**/*.exe
+
 # Runtime / user config (never commit)
 viewTemp.log
 viewTemp.ini
+
+# Diagnostic tool output (re-run enumerate_gpus.bat to regenerate)
+enumerate_gpus.log
 
 # Internal development notes (never commit)
 notes/

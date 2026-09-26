@@ -125,6 +125,63 @@ static DWORD   g_entryStride   = 0;
 static DWORD   g_numEntries    = 0;
 static DWORD   g_gpuEntryCount = 0;
 
+// ---------------------------------------------------------------------------
+// GPU set — dynamic collection. Initialized once at WM_CREATE from MAHM +
+// DXGI; mutated at runtime by SampleMahm (sampled fields) and the context menu
+// (per-GPU showInPanel toggle). Count is whatever MAHM reports as active
+// (szGpuId[0] != 0), so the set is compact and menu IDs stay contiguous
+// (1015 + i, i in [0, g_gpuCount)).
+//
+// IMPORTANT: g_gpus[] is the runtime truth, not a fixed MAX-size array. New
+// hardware or rearranged adapter ordering produces a fresh set each launch
+// and the menu/ini rebuild from it. See notes/continue.md "GPU set" entry.
+// ---------------------------------------------------------------------------
+struct GpuEntry {
+    BOOL   active;            // always TRUE (filtered out inactive slots)
+    int    mahmIndex;         // MAHM gpuEntry array index (for GetSource)
+    TCHAR  name[64];          // friendly name (szDevice[0]?szDevice:szGpuId)
+    TCHAR  device[160];       // MAHM szDevice verbatim
+    TCHAR  gpuId[160];        // MAHM szGpuId verbatim ("VEN_10DE&DEV_28A0&...")
+    TCHAR  gpuIdSafe[160];    // gpuId with '&' '=' replaced by '_' (ini key)
+    double vramTotalGB;       // filled by DXGI match at startup; 0 = no match
+    BOOL   vramFromDxgi;      // for log only
+    double tempC;             // last sample
+    double usagePct;
+    double vramUsedGB;        // computed from vramTotalGB * (raw/100)/100
+    TCHAR  tempStr[16];
+    TCHAR  usageStr[16];
+    TCHAR  vramStr[32];
+    BOOL   showInPanel;       // ini-persisted; menu ID = 1015 + i
+};
+
+static GpuEntry* g_gpus      = NULL;
+static int       g_gpuCount  = 0;
+
+// DXGI adapter info — enumerated once at startup for VRAM total fallback.
+// MAHM doesn't fill dwMemAmount reliably (see notes/continue.md "坑 2"), so
+// DXGI is the only public-API way to get per-card VRAM total.
+struct DxgiAdapterInfo {
+    TCHAR   description[128];
+    UINT    vendorId;        // 0x10DE NVIDIA, 0x8086 Intel, 0x1002 AMD, ...
+    UINT64  dedicatedBytes;  // OS-visible dedicated VRAM (e.g. 7.77GB on a
+                             // nominal-8GB card — WDDM reserves ~256MB)
+};
+static DxgiAdapterInfo* g_dxgi = NULL;
+static int              g_dxgiCount = 0;
+
+// Cached strings (formatted once per sample tick). Only CPU/RAM remain
+// global; GPU strings live per-node inside g_gpus[].name/tempStr/etc.
+static TCHAR   g_cpuTempStr[32]   = TEXT("--");
+static TCHAR   g_cpuUsageStr[32]  = TEXT("--");
+static TCHAR   g_ramStr[32]       = TEXT("--");     // "X.XG / YY.YG (NN%)"
+static TCHAR   g_cpuName[64]      = TEXT("CPU");
+static BOOL    g_mahmAvailable    = FALSE;
+
+// GPU threshold (single value for all GPUs). Per-GPU threshold is overkill
+// for the floating overlay -- one global threshold keeps the flash state
+// machine and ini semantics simple. Set by ini [threshold] Gpu= or hardware
+// auto-match (see notes/continue.md).
+
 // Hover-fade-in state: when the cursor sits inside the window for
 // kHoverDelayMs, the window leaves "click-through" mode (WS_EX_TRANSPARENT)
 // and renders fully opaque so the user can see the overlay is now interactive.
@@ -136,20 +193,6 @@ static BOOL    g_lastCursorInRect   = FALSE;    // last PtInRect result
 static int     g_savedBgAlpha       = -1;      // -1 means "no saved value"
 static int     g_savedFgAlpha       = -1;
 
-// Cached strings (formatted once per sample tick).
-static TCHAR   g_cpuTempStr[32]   = TEXT("--");
-static TCHAR   g_gpuTempStr[32]   = TEXT("--");
-static TCHAR   g_cpuUsageStr[32]  = TEXT("--");
-static TCHAR   g_gpuUsageStr[32]  = TEXT("--");
-static TCHAR   g_vramStr[32]      = TEXT("--");     // "X.XG / YY.YG (NN%)"
-static TCHAR   g_ramStr[32]       = TEXT("--");     // "X.XG / YY.YG (NN%)"
-static TCHAR   g_gpuName[64]      = TEXT("GPU");
-static TCHAR   g_cpuName[64]      = TEXT("CPU");
-static BOOL    g_mahmAvailable    = FALSE;
-
-// Temperature thresholds (°C). Read from [threshold] section of MdViewer.ini.
-// While a sensor's last reported temperature exceeds its threshold, that row's
-// text alternates between fgColor and warning red on a 360 ms tick.
 static int      g_cpuThreshold     = 85;
 static int      g_gpuThreshold     = 85;
 
@@ -158,16 +201,13 @@ static int      g_gpuThreshold     = 85;
 // pushed/popped by SampleMahm based on whether the latest reading crosses the
 // threshold — hysteresis-free, but the 1 s SampleMahm cadence already filters
 // out sub-second jitter.
+//
+// Flash flags: one per CPU and one shared across GPUs (single threshold
+// implies single flash flag — see g_gpuThreshold comment above).
 static BOOL     g_flashCpuOn       = FALSE;
 static BOOL     g_flashGpuOn       = FALSE;
 static BOOL     g_flashTickOdd     = FALSE;  // toggled each kTimerFlash fire
 static BOOL     g_hwFingerprintChecked = FALSE;  // one-shot after first SampleMahm
-
-// VRAM total in bytes, fetched once at startup from DXGI (IDXGIAdapter::GetDesc).
-// Used to fill in the "total" half of the "VRAM: X / Y (Z%)" display when MAHM
-// can't supply it. 0 means "DXGI failed or returned 0" — caller falls back to
-// the original MAHM-only display.
-static UINT64   g_dxgiVramBytes    = 0;
 
 // ---------------------------------------------------------------------------
 // Logging — writes to viewTemp.log next to viewTemp.exe (truncated on launch)
@@ -244,7 +284,11 @@ static void  WriteThresholdSection(int cpuThr, int gpuThr);
 static void  WriteHardwareFingerprintSection(const TCHAR* cpuName, const TCHAR* gpuName);
 static BOOL  LoadHardwareFingerprint(TCHAR* cpuOut, size_t cpuCch,
                                       TCHAR* gpuOut, size_t gpuCch);
-static void  Dxgi_InitVramTotal();
+// static void  Dxgi_InitVramTotal();  // removed -- superseded by InitDxgiAdapterMap
+static void  InitGpuSet();                  // build g_gpus[] from MAHM
+static void  InitDxgiAdapterMap();          // build g_dxgi[] + match vramTotalGB
+static void  BuildGpuIdSafe(const char* src, TCHAR* dst, size_t cch);
+static void  LoadGpuShowFromIni();          // per-GPU showInPanel ini read
 static void  LogOpen();
 static void  Log(const TCHAR* fmt, ...);
 static void  LogClose();
@@ -340,8 +384,9 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM w, LPARAM l)
     case WM_CREATE:
         Log(TEXT("[viewTemp] WM_CREATE hwnd=%p\r\n"), hwnd);
         AddTrayIcon(hwnd);
-        Dxgi_InitVramTotal();  // one-shot VRAM total via DXGI
         MapMahm();
+        InitGpuSet();           // populate g_gpus[] from MAHM
+        InitDxgiAdapterMap();   // populate g_dxgi[] + match vramTotalGB
         SampleMahm();
         return 0;
 
@@ -444,6 +489,9 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM w, LPARAM l)
         KillTimer(hwnd, kTimerIdle);
         RemoveTrayIcon();
         UnmapMahm();
+        // Free GPU set + DXGI arrays (allocated in InitGpuSet / InitDxgiAdapterMap)
+        delete[] g_gpus; g_gpus = NULL; g_gpuCount = 0;
+        delete[] g_dxgi;  g_dxgi  = NULL; g_dxgiCount = 0;
         PostQuitMessage(0);
         return 0;
 
@@ -464,10 +512,22 @@ static void ShowContextMenu(HWND hwnd, POINT pt)
     HMENU hm = CreatePopupMenu();
     AppendMenu(hm, MF_STRING | (g_cfg.topMost    ? MF_CHECKED : 0), 1001, LANG_IF("始终置顶", "Always on Top"));
     AppendMenu(hm, MF_STRING | (g_cfg.showCpu     ? MF_CHECKED : 0), 1002, LANG_IF("显示 CPU", "Show CPU"));
-    AppendMenu(hm, MF_STRING | (g_cfg.showGpu     ? MF_CHECKED : 0), 1003, LANG_IF("显示 GPU", "Show GPU"));
+    AppendMenu(hm, MF_STRING | (g_cfg.showRam     ? MF_CHECKED : 0), 1006, LANG_IF("显示 RAM", "Show RAM"));
     AppendMenu(hm, MF_STRING | (g_cfg.showUsage   ? MF_CHECKED : 0), 1004, LANG_IF("显示使用率", "Show Usage"));
     AppendMenu(hm, MF_STRING | (g_cfg.showVram    ? MF_CHECKED : 0), 1005, LANG_IF("显示 VRAM", "Show VRAM"));
-    AppendMenu(hm, MF_STRING | (g_cfg.showRam     ? MF_CHECKED : 0), 1006, LANG_IF("显示 RAM", "Show RAM"));
+    AppendMenu(hm, MF_SEPARATOR, 0, NULL);
+    // ---- GPU set: one checkbox per detected adapter. IDs start at 1015+i
+    // (避开 1003/1006)。g_gpuCount 决定菜单项数。1003 (老 showGpu 单项) 已废弃
+    // ——新的"显 GPU"语义由"任一 g_gpus[i].showInPanel"承担,等价于老 g_cfg.showGpu。
+    AppendMenu(hm, MF_STRING | (g_cfg.showGpu     ? MF_CHECKED : 0), 1003, LANG_IF("显示 GPU", "Show GPU"));
+    for (int i = 0; i < g_gpuCount; i++) {
+        TCHAR item[200];
+        _sntprintf_s(item, _countof(item), _TRUNCATE,
+                     TEXT("%s GPU %d: %s"),
+                     g_gpus[i].showInPanel ? TEXT("[v]") : TEXT("[ ]"),
+                     i, g_gpus[i].name);
+        AppendMenu(hm, MF_STRING, (UINT)(1015 + i), item);
+    }
     AppendMenu(hm, MF_STRING, 1032, LANG_IF("自动匹配当前硬件阈值", "Auto-match Hardware Thresholds"));
     AppendMenu(hm, MF_SEPARATOR, 0, NULL);
     AppendMenu(hm, MF_STRING, 1010, LANG_IF("字体加大 +", "Larger Font +"));
@@ -493,6 +553,26 @@ static void ShowContextMenu(HWND hwnd, POINT pt)
                              pt.x, pt.y, 0, hwnd, NULL);
     DestroyMenu(hm);
 
+    // ---- GPU set submenu: 1015 + i for i in [0, g_gpuCount) ----
+    if (cmd >= 1015 && cmd < 1015 + g_gpuCount) {
+        int slot = cmd - 1015;
+        g_gpus[slot].showInPanel = !g_gpus[slot].showInPanel;
+        // Persist immediately under the stable PCI-path-derived key (see
+        // notes/continue.md "menu ID vs ini key separation" rationale).
+        TCHAR iniPath[MAX_PATH]; GetIniPath(iniPath, MAX_PATH);
+        TCHAR key[200];
+        _sntprintf_s(key, _countof(key), _TRUNCATE,
+                     TEXT("ShowGpu_%s"), g_gpus[slot].gpuIdSafe);
+        WritePrivateProfileString(TEXT("view"), key,
+            g_gpus[slot].showInPanel ? TEXT("1") : TEXT("0"), iniPath);
+        Log(TEXT("[Menu] gpu[%d] '%s' showInPanel -> %d (ini key ShowGpu_%s)\r\n"),
+            slot, g_gpus[slot].name, (int)g_gpus[slot].showInPanel,
+            g_gpus[slot].gpuIdSafe);
+        ApplyConfigToWindow(hwnd);
+        UpdateLayered(hwnd);
+        return;
+    }
+
     switch (cmd) {
     case 1001:
         g_cfg.topMost = !g_cfg.topMost;
@@ -507,7 +587,11 @@ static void ShowContextMenu(HWND hwnd, POINT pt)
         }
         break;
     case 1002: g_cfg.showCpu = !g_cfg.showCpu; break;
-    case 1003: g_cfg.showGpu = !g_cfg.showGpu; break;
+    case 1003:
+        // 老 showGpu 单项:作为总开关。现在等价于"全部 hide/show"。
+        // 翻转 g_cfg.showGpu;新代码读它判断"GPU 段是否整段渲染"。
+        g_cfg.showGpu = !g_cfg.showGpu;
+        break;
     case 1004: g_cfg.showUsage = !g_cfg.showUsage; break;
     case 1005: g_cfg.showVram = !g_cfg.showVram; break;
     case 1006: g_cfg.showRam = !g_cfg.showRam; break;
@@ -544,11 +628,25 @@ static void ShowContextMenu(HWND hwnd, POINT pt)
         g_gpuThreshold = gpuThr;
         WriteThresholdSection(cpuThr, gpuThr);
         // Refresh the fingerprint so the next startup doesn't re-trigger.
+        // Pick the first dGPU (NVIDIA/AMD) name for the match; fallback to
+        // g_gpus[0].name if none are dGPU. See SampleMahm phase 2 for the
+        // same selection logic — must agree so fingerprints don't bounce.
         TCHAR curCpu[128] = {};
         ReadCpuNameFromRegistry(curCpu, _countof(curCpu));
-        WriteHardwareFingerprintSection(curCpu, g_gpuName);
-        Log(TEXT("[Menu] auto-match thresholds -> cpu=%d gpu=%d\r\n"),
-            cpuThr, gpuThr);
+        const TCHAR* matchName = TEXT("");
+        if (g_gpuCount > 0) matchName = g_gpus[0].name;
+        for (int i = 0; i < g_gpuCount; i++) {
+            // Vendor bytes "10DE" / "1002" at offset 4-7 of gpuId ("VEN_10DE...")
+            if (g_gpus[i].gpuId[4] == TEXT('1') && g_gpus[i].gpuId[5] == TEXT('0') &&
+                (g_gpus[i].gpuId[6] == TEXT('D') && g_gpus[i].gpuId[7] == TEXT('E')) ||
+                (g_gpus[i].gpuId[6] == TEXT('0') && g_gpus[i].gpuId[7] == TEXT('2'))) {
+                matchName = g_gpus[i].name;
+                break;
+            }
+        }
+        WriteHardwareFingerprintSection(curCpu, matchName);
+        Log(TEXT("[Menu] auto-match thresholds -> cpu=%d gpu=%d (gpu='%s')\r\n"),
+            cpuThr, gpuThr, matchName);
         break;
     }
     case 1050: {
@@ -685,17 +783,43 @@ static void UpdateLayered(HWND hwnd)
         if (w > widthPx) widthPx = w;
         heightPx += lh;
     }
+    // ---- GPU set (replaces old single-GPU showGpu block) ----
+    // For each active GPU, render up to 4 lines:
+    //   name (always, when showGpu master is on and this card is checked),
+    //   + temp (if master showGpu && showVram OR master showUsage; we keep
+    //           all 4 always shown for parity with the old single-GPU look),
+    //   + usage,
+    //   + vram.
+    // showGpu (master) AND showInPanel (per-card) both gate the entire block.
+    // showUsage / showVram gate just the temp/usage/vram fields when set.
     if (g_cfg.showGpu) {
-        StringCchPrintfW(lineBuf, 256, L"%s: %s", g_gpuName, g_gpuTempStr);
-        int w = measure(lineBuf);
-        if (w > widthPx) widthPx = w;
-        heightPx += lh;
-    }
-    if (g_cfg.showVram) {
-        StringCchPrintfW(lineBuf, 256, L"VRAM: %s", g_vramStr);
-        int w = measure(lineBuf);
-        if (w > widthPx) widthPx = w;
-        heightPx += lh;
+        for (int i = 0; i < g_gpuCount; i++) {
+            GpuEntry* entry = &g_gpus[i];
+            if (!entry->showInPanel) continue;
+            StringCchPrintfW(lineBuf, 256, L"%s", entry->name);
+            int w = measure(lineBuf);
+            if (w > widthPx) widthPx = w;
+            heightPx += lh;
+            // Temp line (always shown when this card is shown; flash honored)
+            StringCchPrintfW(lineBuf, 256, L"  Temp: %s", entry->tempStr);
+            w = measure(lineBuf);
+            if (w > widthPx) widthPx = w;
+            heightPx += lh;
+            // Usage line
+            if (g_cfg.showUsage) {
+                StringCchPrintfW(lineBuf, 256, L"  Usage: %s", entry->usageStr);
+                w = measure(lineBuf);
+                if (w > widthPx) widthPx = w;
+                heightPx += lh;
+            }
+            // VRAM line
+            if (g_cfg.showVram) {
+                StringCchPrintfW(lineBuf, 256, L"  VRAM: %s", entry->vramStr);
+                w = measure(lineBuf);
+                if (w > widthPx) widthPx = w;
+                heightPx += lh;
+            }
+        }
     }
     if (g_cfg.showRam) {
         StringCchPrintfW(lineBuf, 256, L"RAM: %s", g_ramStr);
@@ -703,12 +827,8 @@ static void UpdateLayered(HWND hwnd)
         if (w > widthPx) widthPx = w;
         heightPx += lh;
     }
-    if (g_cfg.showUsage) {
-        StringCchPrintfW(lineBuf, 256, L"CPU %s / GPU %s", g_cpuUsageStr, g_gpuUsageStr);
-        int w = measure(lineBuf);
-        if (w > widthPx) widthPx = w;
-        heightPx += lh;
-    }
+    // Note: showUsage's OLD single line ("CPU %s / GPU %s") is dropped in favor
+    // of per-GPU "Usage: %s" rows above. showVram is per-GPU now too.
     widthPx += 20;
     heightPx += 12;
 
@@ -770,26 +890,39 @@ static void UpdateLayered(HWND hwnd)
         g.DrawString(lineBuf, -1, &font, Gdiplus::PointF(10, (Gdiplus::REAL)yy), tempBrush(g_flashCpuOn));
         yy += lh;
     }
+    // ---- GPU set rendering (mirrors the measurement loop above) ----
     if (g_cfg.showGpu) {
-        StringCchPrintfW(lineBuf, 256, L"%s: %s", g_gpuName, g_gpuTempStr);
-        g.DrawString(lineBuf, -1, &font, Gdiplus::PointF(10, (Gdiplus::REAL)yy), tempBrush(g_flashGpuOn));
-        yy += lh;
-    }
-    if (g_cfg.showVram) {
-        StringCchPrintfW(lineBuf, 256, L"VRAM: %s", g_vramStr);
-        g.DrawString(lineBuf, -1, &font, Gdiplus::PointF(10, (Gdiplus::REAL)yy), &fg);
-        yy += lh;
+        for (int i = 0; i < g_gpuCount; i++) {
+            GpuEntry* entry = &g_gpus[i];
+            if (!entry->showInPanel) continue;
+            // Name line (no flash on names — temp is the alerted field)
+            StringCchPrintfW(lineBuf, 256, L"%s", entry->name);
+            g.DrawString(lineBuf, -1, &font, Gdiplus::PointF(10, (Gdiplus::REAL)yy), &fg);
+            yy += lh;
+            // Temp line (flash honored — any GPU over threshold triggers)
+            StringCchPrintfW(lineBuf, 256, L"  Temp: %s", entry->tempStr);
+            g.DrawString(lineBuf, -1, &font, Gdiplus::PointF(10, (Gdiplus::REAL)yy), tempBrush(g_flashGpuOn));
+            yy += lh;
+            // Usage
+            if (g_cfg.showUsage) {
+                StringCchPrintfW(lineBuf, 256, L"  Usage: %s", entry->usageStr);
+                g.DrawString(lineBuf, -1, &font, Gdiplus::PointF(10, (Gdiplus::REAL)yy), &fg);
+                yy += lh;
+            }
+            // VRAM
+            if (g_cfg.showVram) {
+                StringCchPrintfW(lineBuf, 256, L"  VRAM: %s", entry->vramStr);
+                g.DrawString(lineBuf, -1, &font, Gdiplus::PointF(10, (Gdiplus::REAL)yy), &fg);
+                yy += lh;
+            }
+        }
     }
     if (g_cfg.showRam) {
         StringCchPrintfW(lineBuf, 256, L"RAM: %s", g_ramStr);
         g.DrawString(lineBuf, -1, &font, Gdiplus::PointF(10, (Gdiplus::REAL)yy), &fg);
         yy += lh;
     }
-    if (g_cfg.showUsage) {
-        StringCchPrintfW(lineBuf, 256, L"CPU %s / GPU %s", g_cpuUsageStr, g_gpuUsageStr);
-        g.DrawString(lineBuf, -1, &font, Gdiplus::PointF(10, (Gdiplus::REAL)yy), &fg);
-        yy += lh;
-    }
+    // showUsage's old single line ("CPU X / GPU Y") is dropped — see measurement section.
 
     BLENDFUNCTION bf = {};
     bf.BlendOp             = AC_SRC_OVER;
@@ -1003,40 +1136,34 @@ static float GetSource(DWORD gpu, DWORD srcId)
 }
 
 // Read first GPU's total VRAM (KB) into out. Returns TRUE if known.
+// SUPERSEDED by InitGpuSet + InitDxgiAdapterMap. Kept as a no-op stub so
+// any stray linker reference compiles (in case notes/continue.md "坑 2"
+// test code or future tooling references it). New code MUST use the GPU
+// set's vramTotalGB directly.
 static BOOL GetGpuVramTotalKb(DWORD gpuIndex, DWORD* outKb)
 {
-    if (!g_pMahm || !outKb || gpuIndex >= g_gpuEntryCount) return FALSE;
-    auto* h = (MAHM_SHARED_MEMORY_HEADER*)g_pMahm;
-    // GPU entries follow the main entry array.
-    BYTE* gpuBase = (BYTE*)g_pMahm + sizeof(MAHM_SHARED_MEMORY_HEADER)
-                    + h->dwNumEntries * h->dwEntrySize;
-    auto* g = (MAHM_SHARED_MEMORY_GPU_ENTRY*)(gpuBase + gpuIndex * h->dwGpuEntrySize);
-    if (g->dwMemAmount == 0) return FALSE;
-    *outKb = g->dwMemAmount;
-    return TRUE;
+    (void)gpuIndex;
+    if (outKb) *outKb = 0;
+    return FALSE;
 }
 
 // Get GPU device display name (e.g. "GeForce RTX 4090") if known.
+// SUPERSEDED by InitGpuSet (g_gpus[i].name). Kept as a no-op stub.
 static void GetGpuName(DWORD gpuIndex, TCHAR* out, size_t cch)
 {
-    if (!g_pMahm || gpuIndex >= g_gpuEntryCount || cch == 0) return;
-    auto* h = (MAHM_SHARED_MEMORY_HEADER*)g_pMahm;
-    BYTE* gpuBase = (BYTE*)g_pMahm + sizeof(MAHM_SHARED_MEMORY_HEADER)
-                    + h->dwNumEntries * h->dwEntrySize;
-    auto* g = (MAHM_SHARED_MEMORY_GPU_ENTRY*)(gpuBase + gpuIndex * h->dwGpuEntrySize);
-    if (g->szDevice[0]) {
-        // szDevice is char (multibyte). Convert to TCHAR (UTF-16) safely.
-        MultiByteToWideChar(CP_ACP, 0, g->szDevice, -1, out, (int)cch);
-        out[cch - 1] = 0;
-    }
+    (void)gpuIndex;
+    if (out && cch) out[0] = 0;
 }
 
 static BOOL SampleMahm()
 {
     if (!g_pMahm && !MapMahm()) {
         StringCchCopy(g_cpuTempStr, _countof(g_cpuTempStr), TEXT("N/A"));
-        StringCchCopy(g_gpuTempStr, _countof(g_gpuTempStr), TEXT("N/A"));
-        StringCchCopy(g_vramStr,    _countof(g_vramStr),    TEXT("N/A"));
+        for (int i = 0; i < g_gpuCount; i++) {
+            StringCchCopy(g_gpus[i].tempStr,  _countof(g_gpus[i].tempStr),  TEXT("N/A"));
+            StringCchCopy(g_gpus[i].usageStr, _countof(g_gpus[i].usageStr), TEXT("N/A"));
+            StringCchCopy(g_gpus[i].vramStr,  _countof(g_gpus[i].vramStr),  TEXT("N/A"));
+        }
         StringCchCopy(g_ramStr,     _countof(g_ramStr),     TEXT("N/A"));
         g_mahmAvailable = FALSE;
         return TRUE;
@@ -1048,8 +1175,11 @@ static BOOL SampleMahm()
         MapMahm();
         if (!g_pMahm) {
             StringCchCopy(g_cpuTempStr, _countof(g_cpuTempStr), TEXT("--"));
-            StringCchCopy(g_gpuTempStr, _countof(g_gpuTempStr), TEXT("--"));
-            StringCchCopy(g_vramStr,    _countof(g_vramStr),    TEXT("--"));
+            for (int i = 0; i < g_gpuCount; i++) {
+                StringCchCopy(g_gpus[i].tempStr,  _countof(g_gpus[i].tempStr),  TEXT("--"));
+                StringCchCopy(g_gpus[i].usageStr, _countof(g_gpus[i].usageStr), TEXT("--"));
+                StringCchCopy(g_gpus[i].vramStr,  _countof(g_gpus[i].vramStr),  TEXT("--"));
+            }
             StringCchCopy(g_ramStr,     _countof(g_ramStr),     TEXT("--"));
             g_mahmAvailable = FALSE;
             return TRUE;
@@ -1063,8 +1193,6 @@ static BOOL SampleMahm()
     // ---- CPU (global) ----
     float cpuT = GetSource(MAHM_GPU_INDEX_GLOBAL, MAHM_SRC_CPU_TEMPERATURE);
     if (cpuT == FLT_MAX || cpuT <= -100.f) {
-        // Some setups leave CPU temperature blank; fall back to first non-GPU entry
-        // that reports a CPU temperature id (still global).
         StringCchCopy(g_cpuTempStr, _countof(g_cpuTempStr), TEXT("--"));
     } else {
         StringCchPrintfW(g_cpuTempStr, _countof(g_cpuTempStr), L"%.0f°C", cpuT);
@@ -1073,33 +1201,53 @@ static BOOL SampleMahm()
     if (cpuU == FLT_MAX) StringCchCopy(g_cpuUsageStr, _countof(g_cpuUsageStr), TEXT("--"));
     else                 StringCchPrintfW(g_cpuUsageStr, _countof(g_cpuUsageStr), L"%.0f%%", cpuU);
 
-    // ---- GPU 0 ----
-    float gpuT = GetSource(0, MAHM_SRC_GPU_TEMPERATURE);
-    if (gpuT == FLT_MAX) StringCchCopy(g_gpuTempStr, _countof(g_gpuTempStr), TEXT("--"));
-    else                 StringCchPrintfW(g_gpuTempStr, _countof(g_gpuTempStr), L"%.0f°C", gpuT);
+    // ---- GPU set: per-card sample loop ----
+    // Each iteration:
+    //   1. Read MAHM_SRC_GPU_TEMPERATURE / GPU_USAGE / MEMORY_USAGE
+    //   2. Convert raw -> string, write into g_gpus[i].tempStr/usageStr/vramStr
+    //   3. For VRAM: combine MAHM percentage (raw=percent*100) with the
+    //      per-card vramTotalGB populated at startup by InitDxgiAdapterMap().
+    //      If vramTotalGB==0 (no DXGI match), fall back to "percent only" —
+    //      "(NN.N%)" — same as the existing single-GPU fallback.
+    for (int i = 0; i < g_gpuCount; i++) {
+        GpuEntry* entry = &g_gpus[i];
+        DWORD midx = (DWORD)entry->mahmIndex;
 
-    float gpuU = GetSource(0, MAHM_SRC_GPU_USAGE);
-    if (gpuU == FLT_MAX) StringCchCopy(g_gpuUsageStr, _countof(g_gpuUsageStr), TEXT("--"));
-    else                 StringCchPrintfW(g_gpuUsageStr, _countof(g_gpuUsageStr), L"%.0f%%", gpuU);
-
-    // ---- VRAM ----
-    // VRAM: only MAHM is available for percentage. NVAPI was removed because
-    // NVIDIA's modern nvapi64.dll is COM-only (no flat exports — see NvApi.h
-    // stub and continue.md "坑 2"). For the total, DXGI's
-    // IDXGIAdapter::GetDesc was queried once at startup (Dxgi_InitVramTotal)
-    // and cached in g_dxgiVramBytes — this works for AMD/Intel/NVIDIA alike.
-    {
-        float vramPct = GetSource(0, MAHM_SRC_MEMORY_USAGE);
-        Log(TEXT("[Vram] MAHM raw pct=%.4f (interpreted percent*100), DXGI total=%llu bytes\r\n"),
-            vramPct, (unsigned long long)g_dxgiVramBytes);
-        if (vramPct == FLT_MAX) {
-            StringCchCopy(g_vramStr, _countof(g_vramStr), TEXT("--"));
+        float gpuT = GetSource(midx, MAHM_SRC_GPU_TEMPERATURE);
+        if (gpuT == FLT_MAX) {
+            StringCchCopy(entry->tempStr, _countof(entry->tempStr), TEXT("--"));
+            entry->tempC = 0.0;
         } else {
-            double pct    = (double)vramPct / 100.0;  // raw is "percent*100"
-            double totalG = (double)g_dxgiVramBytes / (1024.0 * 1024.0 * 1024.0);
-            double usedG  = totalG * pct / 100.0;
-            StringCchPrintfW(g_vramStr, _countof(g_vramStr),
-                              L"%.2fG / %.2fG (%.0f%%)", usedG, totalG, pct);
+            entry->tempC = (double)gpuT;
+            StringCchPrintfW(entry->tempStr, _countof(entry->tempStr), L"%.0f°C", gpuT);
+        }
+
+        float gpuU = GetSource(midx, MAHM_SRC_GPU_USAGE);
+        if (gpuU == FLT_MAX) {
+            StringCchCopy(entry->usageStr, _countof(entry->usageStr), TEXT("--"));
+            entry->usagePct = 0.0;
+        } else {
+            entry->usagePct = (double)gpuU;
+            StringCchPrintfW(entry->usageStr, _countof(entry->usageStr), L"%.0f%%", gpuU);
+        }
+
+        float vramPct = GetSource(midx, MAHM_SRC_MEMORY_USAGE);
+        if (vramPct == FLT_MAX) {
+            StringCchCopy(entry->vramStr, _countof(entry->vramStr), TEXT("--"));
+            entry->vramUsedGB = 0.0;
+        } else {
+            double pct = (double)vramPct / 100.0;  // raw is "percent*100"
+            if (entry->vramTotalGB > 0.0) {
+                double usedG = entry->vramTotalGB * pct / 100.0;
+                entry->vramUsedGB = usedG;
+                StringCchPrintfW(entry->vramStr, _countof(entry->vramStr),
+                    L"%.2fG / %.2fG (%.1f%%)", usedG, entry->vramTotalGB, pct);
+            } else {
+                // No DXGI total — display percent only.
+                entry->vramUsedGB = 0.0;
+                StringCchPrintfW(entry->vramStr, _countof(entry->vramStr),
+                    L"%.1f%%", pct);
+            }
         }
     }
 
@@ -1118,37 +1266,52 @@ static BOOL SampleMahm()
         }
     }
 
-    // ---- Names ----
-    if (g_gpuName[0] == TEXT('G') && g_gpuName[1] == TEXT('P') && g_gpuName[2] == TEXT('U'))
-        GetGpuName(0, g_gpuName, _countof(g_gpuName));
-
     g_mahmAvailable = TRUE;
-    Log(TEXT("[Sample-MAHM] CPU=%s GPU=%s VRAM=%s RAM=%s cpuU=%s gpuU=%s name=%s nvapi=stubbed\r\n"),
-        g_cpuTempStr, g_gpuTempStr, g_vramStr, g_ramStr, g_cpuUsageStr, g_gpuUsageStr, g_gpuName);
+    // One-line summary per GPU for log readability. Long lines but 老林 uses
+    // DebugView / Notepad -- both wrap fine.
+    {
+        TCHAR gpuLog[1024] = {};
+        TCHAR* p = gpuLog;
+        size_t left = _countof(gpuLog);
+        for (int i = 0; i < g_gpuCount && left > 32; i++) {
+            int wrote = _sntprintf_s(p, left, _TRUNCATE,
+                TEXT("[gpu%d '%s'] t=%s u=%s v=%s%s"),
+                i, g_gpus[i].name,
+                g_gpus[i].tempStr, g_gpus[i].usageStr, g_gpus[i].vramStr,
+                (i + 1 < g_gpuCount) ? TEXT(" ") : TEXT(""));
+            if (wrote < 0) break;
+            p += wrote; left -= wrote;
+        }
+        Log(TEXT("[Sample-MAHM] cpu=%s cpuU=%s ram=%s %s\r\n"),
+            g_cpuTempStr, g_cpuUsageStr, g_ramStr, gpuLog);
+    }
 
     // ---- Threshold flash state machine ----
-    // Push/pop each row's flash flag based on the latest cached temperature
-    // string. We parse the "NN°C" form rather than the raw float so this
-    // works uniformly across MAHM and NVAPI fallback paths. "--"/"N/A" are
-    // treated as "no reading" and clear the flash state.
+    // Single GPU flash flag covers all GPU rows (one threshold for the whole
+    // set; per-GPU threshold would multiply complexity for no real value).
+    // "ANY GPU over threshold -> flash on".
     {
         auto parseCelsius = [](const TCHAR* s) -> float {
             if (!s || !*s || s[0] == TEXT('-') || s[0] == TEXT('N')) return -FLT_MAX;
             return (float)_tcstod(s, nullptr);
         };
         float cpuT = parseCelsius(g_cpuTempStr);
-        float gpuT = parseCelsius(g_gpuTempStr);
-        BOOL  cpuHot = (cpuT > (float)g_cpuThreshold);
-        BOOL  gpuHot = (gpuT > (float)g_gpuThreshold);
+        float maxGpuT = -FLT_MAX;
+        for (int i = 0; i < g_gpuCount; i++) {
+            float t = parseCelsius(g_gpus[i].tempStr);
+            if (t > maxGpuT) maxGpuT = t;
+        }
+        BOOL cpuHot = (cpuT > (float)g_cpuThreshold);
+        BOOL gpuHot = (maxGpuT > (float)g_gpuThreshold);
         if (cpuHot != g_flashCpuOn || gpuHot != g_flashGpuOn) {
-            Log(TEXT("[Threshold] cpuT=%.1f cpuThr=%d -> flashCpu=%d  gpuT=%.1f gpuThr=%d -> flashGpu=%d\r\n"),
-                cpuT, g_cpuThreshold, (int)cpuHot, gpuT, g_gpuThreshold, (int)gpuHot);
+            Log(TEXT("[Threshold] cpuT=%.1f cpuThr=%d -> flashCpu=%d  maxGpuT=%.1f gpuThr=%d -> flashGpu=%d\r\n"),
+                cpuT, g_cpuThreshold, (int)cpuHot, maxGpuT, g_gpuThreshold, (int)gpuHot);
             g_flashCpuOn = cpuHot;
             g_flashGpuOn = gpuHot;
         }
 
         // Hot-reload thresholds from ini each tick so users can edit
-        // MdViewer.ini and see the change within ≤1 s without restarting.
+        // viewTemp.ini and see the change within ≤1 s without restarting.
         // Default arg is the existing value — if the ini/key is missing we
         // keep what we had rather than snapping back to the hardcoded 85.
         TCHAR iniPath[MAX_PATH]; GetIniPath(iniPath, MAX_PATH);
@@ -1167,24 +1330,43 @@ static BOOL SampleMahm()
 
     // ---- (NVAPI fallback removed — see NvApi.h stub and continue.md 坑 2) ----
 
-    Log(TEXT("[Sample-Final] CPU=%s GPU=%s VRAM=%s\r\n"),
-        g_cpuTempStr, g_gpuTempStr, g_vramStr);
-
-    // Hardware-fingerprint phase 2: now that g_gpuName has been refreshed
-    // by SampleMahm, compare against [hardware] in the ini. A mismatch means
-    // the user swapped hardware (or our database grew a new match for a
-    // previously-unmatched model). Re-run the match and update ini.
-    // Guard: skip until g_gpuName has been replaced from the "GPU" default.
-    if (!g_hwFingerprintChecked && g_gpuName[0]
-        && !(g_gpuName[0] == TEXT('G') && g_gpuName[1] == TEXT('P')
-             && g_gpuName[2] == TEXT('U') && g_gpuName[3] == 0)) {
+    // Hardware-fingerprint phase 2: now that g_gpus[0].name has been set
+    // from MAHM (it carries the friendly name from szDevice), compare
+    // against [hardware] in the ini. A mismatch means the user swapped
+    // hardware (or our database grew a new match). Re-run the match and
+    // update ini.
+    //
+    // Guard: skip until the set has been populated by InitGpuSet. We use
+    // g_gpus[0].active as the signal — g_gpuCount==0 means we never built
+    // the set (MAHM unavailable at startup), so there's nothing to compare.
+    if (!g_hwFingerprintChecked && g_gpuCount > 0 && g_gpus[0].name[0]) {
         g_hwFingerprintChecked = TRUE;
+        // Use the first *dGPU* (NVIDIA/AMD) for the threshold match — iGPU
+        // temperatures often aren't in hardware_db.h. If none of the GPUs
+        // are a dGPU, fall back to the first GPU in the set.
+        const TCHAR* matchName = g_gpus[0].name;
+        UINT matchVendor = 0;
+        for (int i = 0; i < g_gpuCount; i++) {
+            // szGpuId starts with "VEN_XXXX" — extract the vendor nibbles.
+            UINT ven = 0;
+            if (_sntscanf_s(g_gpus[i].gpuId, _countof(g_gpus[i].gpuId),
+                            TEXT("VEN_%x"), &ven) == 1) {
+                if (ven == 0x10DE /* NVIDIA */ || ven == 0x1002 /* AMD */) {
+                    matchName = g_gpus[i].name;
+                    matchVendor = ven;
+                    break;
+                }
+            }
+        }
+        Log(TEXT("[HwDetect] threshold match name='%s' (vendor=0x%04X)\r\n"),
+            matchName, matchVendor);
+
         TCHAR prevCpu[128] = {}, prevGpu[128] = {};
         if (LoadHardwareFingerprint(prevCpu, _countof(prevCpu),
                                     prevGpu, _countof(prevGpu))) {
             TCHAR curCpu[128] = {};
             ReadCpuNameFromRegistry(curCpu, _countof(curCpu));
-            if (_tcscmp(prevCpu, curCpu) != 0 || _tcscmp(prevGpu, g_gpuName) != 0) {
+            if (_tcscmp(prevCpu, curCpu) != 0 || _tcscmp(prevGpu, matchName) != 0) {
                 int cpuThr = 0, gpuThr = 0;
                 MatchHardwareThresholds(&cpuThr, &gpuThr);
                 if (cpuThr != g_cpuThreshold || gpuThr != g_gpuThreshold) {
@@ -1194,7 +1376,7 @@ static BOOL SampleMahm()
                     Log(TEXT("[Ini] hw changed -> [threshold] cpu=%d gpu=%d\r\n"),
                         cpuThr, gpuThr);
                 }
-                WriteHardwareFingerprintSection(curCpu, g_gpuName);
+                WriteHardwareFingerprintSection(curCpu, matchName);
             }
         } else {
             // No fingerprint recorded yet but [threshold] exists — record
@@ -1202,9 +1384,9 @@ static BOOL SampleMahm()
             // upgrade path: existing users have [threshold] but no [hardware].
             TCHAR curCpu[128] = {};
             ReadCpuNameFromRegistry(curCpu, _countof(curCpu));
-            WriteHardwareFingerprintSection(curCpu, g_gpuName);
+            WriteHardwareFingerprintSection(curCpu, matchName);
             Log(TEXT("[Ini] recorded [hardware] fp for existing install: cpu='%s' gpu='%s'\r\n"),
-                curCpu, g_gpuName);
+                curCpu, matchName);
         }
     }
     return TRUE;
@@ -1262,17 +1444,32 @@ static void ReadCpuNameFromRegistry(TCHAR* out, size_t cch)
 }
 
 // Returns the warn temperature for the current CPU/GPU by looking up the
-// g_cpuName / g_gpuName in hardware_db.h. If either sensor fails to match
-// the database, the corresponding default (85 °C) is returned and the
-// "matched" flag in the output pair is FALSE.
+// CPU brand and the first dGPU name in hardware_db.h. If either sensor
+// fails to match the database, the corresponding default (85 °C) is
+// returned and the "matched" flag in the output pair is FALSE.
 static BOOL MatchHardwareThresholds(int* outCpu, int* outGpu)
 {
     // Ensure we have a fresh CPU name (g_cpuName is "CPU" by default and is
-    // never updated from MAHM, unlike g_gpuName which SampleMahm refreshes).
+    // never updated from MAHM, unlike g_gpus[i].name which InitGpuSet populates).
     TCHAR cpuName[128] = {};
     ReadCpuNameFromRegistry(cpuName, _countof(cpuName));
     const TCHAR* cpuLookup = (cpuName[0] ? cpuName : g_cpuName);
-    const TCHAR* gpuLookup = g_gpuName;
+    // SampleMahm picks the dGPU name for the hardware_db lookup (iGPU names
+    // rarely match the DB). matchName is owned by the caller (g_gpus[i].name).
+    // We don't have access to g_gpus here — caller is expected to pass a
+    // dGPU-derived name. Fall back to g_cpuName-suffixed placeholder if empty.
+    const TCHAR* gpuLookup = TEXT("");
+    for (int i = 0; i < g_gpuCount; i++) {
+        if (g_gpus[i].name[0] && (g_gpus[i].gpuId[3] == TEXT('1') &&
+            g_gpus[i].gpuId[4] == TEXT('0') && g_gpus[i].gpuId[5] == TEXT('D') &&
+            g_gpus[i].gpuId[6] == TEXT('E') /* 0x10DE NVIDIA */) ||
+            (g_gpus[i].gpuId[3] == TEXT('1') && g_gpus[i].gpuId[4] == TEXT('0') &&
+             g_gpus[i].gpuId[5] == TEXT('0') && g_gpus[i].gpuId[6] == TEXT('2') /* 0x1002 AMD */)) {
+            gpuLookup = g_gpus[i].name;
+            break;
+        }
+    }
+    if (!gpuLookup[0] && g_gpuCount > 0) gpuLookup = g_gpus[0].name;
 
     int cpuWarn = 85, gpuWarn = 85;
     BOOL cpuHit = LookupHardwareThreshold(kCpuDb, _countof(kCpuDb),
@@ -1326,14 +1523,123 @@ static BOOL LoadHardwareFingerprint(TCHAR* cpuOut, size_t cpuCch,
     return (gotCpu > 0 && gotGpu > 0);
 }
 
-// Read the GPU's DedicatedVideoMemory from DXGI (IDXGIAdapter::GetDesc) and
-// stash it in g_dxgiVramBytes. Called once at startup, silent on failure.
-// MAHM can't supply VRAM total in current RivaTuner driver builds (see坑 2),
-// and the modern NVAPI path is COM-only — DXGI is the cheapest public-API
-// alternative. Works on AMD/Intel/NVIDIA without per-vendor code.
-static void Dxgi_InitVramTotal()
+// Build GpuEntry set from MAHM. Two-pass scan:
+//   pass 1: count active GPUs (szGpuId[0] != 0) so we can size g_gpus[].
+//   pass 2: populate each node — name from szDevice, gpuId from szGpuId,
+//           gpuIdSafe from gpuId with '&' '=' replaced by '_' (ini key).
+//
+// Called once from WM_CREATE after MapMahm. Safe to call when MAHM isn't
+// mapped (then g_numEntries/g_gpuEntryCount are 0 and the function does
+// nothing — g_gpus stays NULL, g_gpuCount stays 0).
+static void InitGpuSet()
 {
-    if (g_dxgiVramBytes != 0) return;  // already populated
+    delete[] g_gpus; g_gpus = NULL; g_gpuCount = 0;
+
+    if (!g_pMahm || g_gpuEntryCount == 0) {
+        Log(TEXT("[GpuSet] no MAHM GPU entries\r\n"));
+        return;
+    }
+
+    auto* h = (MAHM_SHARED_MEMORY_HEADER*)g_pMahm;
+    BYTE* gpuBase = (BYTE*)g_pMahm + sizeof(MAHM_SHARED_MEMORY_HEADER)
+                    + h->dwNumEntries * h->dwEntrySize;
+
+    // Pass 1: count.
+    int active = 0;
+    for (DWORD i = 0; i < g_gpuEntryCount; i++) {
+        auto* e = (MAHM_SHARED_MEMORY_GPU_ENTRY*)(gpuBase + i * h->dwGpuEntrySize);
+        if (e->szGpuId[0] != 0) active++;
+    }
+    if (active == 0) {
+        Log(TEXT("[GpuSet] 0 active GPUs in MAHM\r\n"));
+        return;
+    }
+    g_gpuCount = active;
+    g_gpus = new GpuEntry[active];
+    ZeroMemory(g_gpus, sizeof(GpuEntry) * active);
+
+    // Pass 2: populate.
+    int slot = 0;
+    for (DWORD i = 0; i < g_gpuEntryCount && slot < active; i++) {
+        auto* e = (MAHM_SHARED_MEMORY_GPU_ENTRY*)(gpuBase + i * h->dwGpuEntrySize);
+        if (e->szGpuId[0] == 0) continue;
+        GpuEntry* entry = &g_gpus[slot];
+        entry->active = TRUE;
+        entry->mahmIndex = (int)i;
+
+        // Friendly name: prefer szDevice, fallback to szFamily, then szGpuId.
+        const char* nm = e->szDevice[0] ? e->szDevice
+                       : e->szFamily[0] ? e->szFamily
+                       : e->szGpuId;
+        MultiByteToWideChar(CP_ACP, 0, nm, -1, entry->name, _countof(entry->name));
+        entry->name[_countof(entry->name) - 1] = 0;
+
+        // szDevice verbatim (for log / hardware fingerprint).
+        MultiByteToWideChar(CP_ACP, 0, e->szDevice, -1,
+                            entry->device, _countof(entry->device));
+        entry->device[_countof(entry->device) - 1] = 0;
+
+        // szGpuId verbatim (PCI path).
+        MultiByteToWideChar(CP_ACP, 0, e->szGpuId, -1,
+                            entry->gpuId, _countof(entry->gpuId));
+        entry->gpuId[_countof(entry->gpuId) - 1] = 0;
+
+        // gpuIdSafe = gpuId with '&' '=' replaced by '_' (ini key chars).
+        BuildGpuIdSafe(e->szGpuId, entry->gpuIdSafe, _countof(entry->gpuIdSafe));
+
+        // Defaults — refreshed later by LoadConfigFromIni if a saved value
+        // exists under [view] ShowGpu_<gpuIdSafe>=.
+        entry->showInPanel = TRUE;
+        entry->vramTotalGB = 0.0;
+        entry->vramFromDxgi = FALSE;
+
+        Log(TEXT("[GpuSet] gpu[%d] mahmIdx=%lu name='%s' id='%s' safe='%s'\r\n"),
+            slot, (unsigned long)i, entry->name, entry->gpuId, entry->gpuIdSafe);
+        slot++;
+    }
+
+    // Per-GPU showInPanel from ini (after the set exists — LoadConfigFromIni
+    // runs in wWinMain BEFORE CreateWindowEx, so g_gpus is NULL at that
+    // point). Defaults: TRUE (key missing = show).
+    LoadGpuShowFromIni();
+}
+
+// Copy src (ASCII PCI path like "VEN_10DE&DEV_28A0&...") into dst, replacing
+// '&' and '=' with '_'. ini keys can't contain '&' or '=' safely — see
+// notes/continue.md "menu ID vs ini key separation" rationale.
+static void BuildGpuIdSafe(const char* src, TCHAR* dst, size_t cch)
+{
+    if (!dst || cch == 0) return;
+    if (!src) { dst[0] = 0; return; }
+    for (size_t k = 0; k + 1 < cch; k++) {
+        char c = src[k];
+        if (c == 0) { dst[k] = 0; return; }
+        if (c == '&' || c == '=') c = '_';
+        dst[k] = (TCHAR)(unsigned char)c;
+    }
+    dst[cch - 1] = 0;
+}
+
+// Enumerate DXGI adapters. Two-pass scan:
+//   pass 1: count via EnumAdapters loop
+//   pass 2: pull Description/VendorId/DedicatedVideoMemory for each
+// Then match each MAHM GPU entry (g_gpus[i]) to a DXGI adapter by parsing
+// the VEN_xxxx prefix in gpuId[] and comparing against adapter.VendorId.
+// When matched, store adapter->DedicatedVideoMemory into g_gpus[i].vramTotalGB
+// (in GB).
+//
+// We use VendorId as the primary key because two GPUs from the same vendor
+// (e.g. dual NVIDIA) are rare in the consumer laptop / desktop segments
+// viewTemp targets. If 老林 later hits a same-vendor multi-GPU scenario the
+// fallback is "first match wins" — good enough until we hit the problem.
+//
+// Note: DXGI also reports WDDM virtual adapters (e.g. Microsoft Basic Render
+// Driver, "virtual" displays). These have VendorId=0x1414 (Microsoft) and
+// DedicatedVideoMemory=0 — the matching logic naturally ignores them because
+// g_gpus[] has no entry with VEN_1414.
+static void InitDxgiAdapterMap()
+{
+    delete[] g_dxgi; g_dxgi = NULL; g_dxgiCount = 0;
 
     IDXGIFactory* factory = NULL;
     HRESULT hr = CreateDXGIFactory(__uuidof(IDXGIFactory),
@@ -1343,31 +1649,98 @@ static void Dxgi_InitVramTotal()
         return;
     }
 
-    // Pick adapter index 0 (primary GPU). If the user has multiple GPUs the
-    // MAHM-reported name still drives which adapter we want, but for the
-    // VRAM total we just need *any* dedicated GPU memory — primary is good
-    // enough for the single-row display.
-    IDXGIAdapter* adapter = NULL;
-    hr = factory->EnumAdapters(0, &adapter);
-    if (FAILED(hr) || !adapter) {
-        Log(TEXT("[Dxgi] EnumAdapters(0) FAILED hr=0x%08lx\r\n"), hr);
+    // Pass 1: count.
+    int n = 0;
+    for (UINT i = 0; ; i++) {
+        IDXGIAdapter* probe = NULL;
+        if (factory->EnumAdapters(i, &probe) == DXGI_ERROR_NOT_FOUND) break;
+        if (probe) probe->Release();
+        n++;
+    }
+    if (n == 0) {
+        Log(TEXT("[Dxgi] EnumAdapters returned 0 adapters\r\n"));
         factory->Release();
         return;
     }
+    g_dxgiCount = n;
+    g_dxgi = new DxgiAdapterInfo[n];
+    ZeroMemory(g_dxgi, sizeof(DxgiAdapterInfo) * n);
 
-    DXGI_ADAPTER_DESC desc = {};
-    hr = adapter->GetDesc(&desc);
-    if (SUCCEEDED(hr)) {
-        g_dxgiVramBytes = desc.DedicatedVideoMemory;
-        double gb = (double)g_dxgiVramBytes / (1024.0 * 1024.0 * 1024.0);
-        Log(TEXT("[Dxgi] adapter='%ls' DedicatedVideoMemory=%.2fGB (%llu bytes)\r\n"),
-            desc.Description, gb, (unsigned long long)g_dxgiVramBytes);
-    } else {
-        Log(TEXT("[Dxgi] GetDesc FAILED hr=0x%08lx\r\n"), hr);
+    // Pass 2: populate.
+    int kept = 0;
+    for (UINT i = 0; i < (UINT)n; i++) {
+        IDXGIAdapter* ad = NULL;
+        if (FAILED(factory->EnumAdapters(i, &ad)) || !ad) continue;
+        DXGI_ADAPTER_DESC desc = {};
+        if (SUCCEEDED(ad->GetDesc(&desc))) {
+            DxgiAdapterInfo* a = &g_dxgi[kept];
+            a->vendorId = desc.VendorId;
+            a->dedicatedBytes = desc.DedicatedVideoMemory;
+            // Description is WCHAR; we copied into a TCHAR buffer for simplicity.
+            _tcsncpy_s(a->description, _countof(a->description),
+                       desc.Description, _TRUNCATE);
+            double gb = (double)desc.DedicatedVideoMemory / (1024.0 * 1024.0 * 1024.0);
+            Log(TEXT("[Dxgi] adapter[%d] desc='%ls' vendor=0x%04X vram=%.2fGB (%llu bytes)\r\n"),
+                kept, a->description, a->vendorId, gb,
+                (unsigned long long)desc.DedicatedVideoMemory);
+            kept++;
+        }
+        ad->Release();
     }
-
-    adapter->Release();
     factory->Release();
+
+    if (kept < g_dxgiCount) g_dxgiCount = kept;  // tighten if some GetDesc failed
+
+    // Match each MAHM GPU entry to a DXGI adapter by VendorId prefix.
+    for (int i = 0; i < g_gpuCount; i++) {
+        GpuEntry* entry = &g_gpus[i];
+        // Parse "VEN_xxxx" from gpuId (ASCII in TCHAR buffer).
+        UINT ven = 0;
+        if (_sntscanf_s(entry->gpuId, _countof(entry->gpuId), TEXT("VEN_%x"), &ven) != 1) {
+            Log(TEXT("[DxgiMatch] gpu[%d] '%s' has no VEN_ prefix, skip match\r\n"),
+                i, entry->name);
+            continue;
+        }
+        for (int j = 0; j < g_dxgiCount; j++) {
+            if (g_dxgi[j].vendorId == ven && g_dxgi[j].dedicatedBytes > 0) {
+                entry->vramTotalGB = (double)g_dxgi[j].dedicatedBytes
+                                 / (1024.0 * 1024.0 * 1024.0);
+                entry->vramFromDxgi = TRUE;
+                Log(TEXT("[DxgiMatch] gpu[%d] '%s' VEN=0x%04X -> adapter[%d] vram=%.2fGB\r\n"),
+                    i, entry->name, ven, j, entry->vramTotalGB);
+                break;
+            }
+        }
+        if (!entry->vramFromDxgi) {
+            Log(TEXT("[DxgiMatch] gpu[%d] '%s' VEN=0x%04X: no DXGI adapter match (vram=0)\r\n"),
+                i, entry->name, ven);
+        }
+    }
+}
+
+// Per-GPU showInPanel hot-reload from ini. Called from InitGpuSet AFTER the
+// set is built — at LoadConfigFromIni time g_gpus is still NULL.
+//
+// Each g_gpus[i].showInPanel is loaded under the stable PCI-path-derived key
+// ShowGpu_<gpuIdSafe>= in the [view] section. Missing keys default to TRUE
+// (first run). This function does NOT write back — users can edit ini and
+// the change is reflected within ≤1 s via the menu handler that calls
+// WritePrivateProfileString directly. No hot-reload here on purpose: if a
+// user edits the file we want the toggle to be a deliberate menu action,
+// not a silent overwrite of their current toggle state on every sample tick.
+static void LoadGpuShowFromIni()
+{
+    if (!g_gpus || g_gpuCount == 0) return;
+    TCHAR iniPath[MAX_PATH]; GetIniPath(iniPath, MAX_PATH);
+    for (int i = 0; i < g_gpuCount; i++) {
+        TCHAR key[200];
+        _sntprintf_s(key, _countof(key), _TRUNCATE,
+                     TEXT("ShowGpu_%s"), g_gpus[i].gpuIdSafe);
+        int v = GetPrivateProfileInt(TEXT("view"), key, 1, iniPath);
+        g_gpus[i].showInPanel = (v != 0);
+        Log(TEXT("[Ini] gpu[%d] '%s' showInPanel=%d (key=%s)\r\n"),
+            i, g_gpus[i].name, (int)g_gpus[i].showInPanel, key);
+    }
 }
 
 static void LoadConfigFromIni()
@@ -1378,7 +1751,7 @@ static void LoadConfigFromIni()
     g_cfg.opacityPct    = GetPrivateProfileInt(TEXT("view"), TEXT("Opacity"),    100, path);
     g_cfg.topMost       = GetPrivateProfileInt(TEXT("view"), TEXT("TopMost"),    1, path);
     g_cfg.showCpu       = GetPrivateProfileInt(TEXT("view"), TEXT("ShowCpu"),    1, path);
-    g_cfg.showGpu       = GetPrivateProfileInt(TEXT("view"), TEXT("ShowGpu"),    1, path);
+    g_cfg.showGpu       = GetPrivateProfileInt(TEXT("view"), TEXT("ShowGpu"),    1, path);  // legacy master toggle
     g_cfg.showUsage     = GetPrivateProfileInt(TEXT("view"), TEXT("ShowUsage"),  0, path);
     g_cfg.showVram      = GetPrivateProfileInt(TEXT("view"), TEXT("ShowVram"),   1, path);
     g_cfg.showRam       = GetPrivateProfileInt(TEXT("view"), TEXT("ShowRam"),    1, path);
@@ -1392,11 +1765,15 @@ static void LoadConfigFromIni()
     if (g_gpuThreshold > 150) g_gpuThreshold = 150;
     Log(TEXT("[Ini] thresholds cpu=%d gpu=%d\r\n"), g_cpuThreshold, g_gpuThreshold);
 
+    // NOTE: per-GPU ShowGpu_<gpuIdSafe> is loaded in LoadGpuShowFromIni(),
+    // called from InitGpuSet() at WM_CREATE time — g_gpus doesn't exist yet
+    // here. See that function for rationale.
+
     // Startup hardware-threshold logic — phase 1 (ini read):
     //   - If [threshold] section is missing entirely (fresh install), seed
     //     it via hardware match. We can't check [hardware] fingerprint yet
-    //     because SampleMahm hasn't run to populate g_gpuName — that check
-    //     happens in phase 2 below.
+    //     because SampleMahm hasn't run to populate g_gpus[0].name — that
+    //     check happens in phase 2 below.
     {
         TCHAR sectBuf[8] = {};
         DWORD sectLen = GetPrivateProfileSection(TEXT("threshold"), sectBuf,
@@ -1409,8 +1786,12 @@ static void LoadConfigFromIni()
             g_cpuThreshold = cpuThr;
             g_gpuThreshold = gpuThr;
             WriteThresholdSection(cpuThr, gpuThr);
-            WriteHardwareFingerprintSection(curCpu, g_gpuName);
-            Log(TEXT("[Ini] seeded [threshold] cpu=%d gpu=%d, [hardware] fp recorded\r\n"),
+            // matchName picked by SampleMahm's phase 2 will be a dGPU name
+            // when available; record the CPU and a placeholder here so the
+            // next SampleMahm pass can compare and overwrite if needed.
+            TCHAR placeholderGpu[64] = TEXT("(pending first sample)");
+            WriteHardwareFingerprintSection(curCpu, placeholderGpu);
+            Log(TEXT("[Ini] seeded [threshold] cpu=%d gpu=%d, [hardware] placeholder fp recorded\r\n"),
                 cpuThr, gpuThr);
         }
     }
@@ -1435,7 +1816,7 @@ static void SaveConfigToIni()
     WritePrivateProfileString(TEXT("view"), TEXT("TopMost"), buf, path);
     StringCchPrintf(buf, _countof(buf), TEXT("%d"), g_cfg.showCpu ? 1 : 0);
     WritePrivateProfileString(TEXT("view"), TEXT("ShowCpu"), buf, path);
-    StringCchPrintf(buf, _countof(buf), TEXT("%d"), g_cfg.showGpu ? 1 : 0);
+    StringCchPrintf(buf, _countof(buf), TEXT("%d"), g_cfg.showGpu ? 1 : 0);  // legacy master
     WritePrivateProfileString(TEXT("view"), TEXT("ShowGpu"), buf, path);
     StringCchPrintf(buf, _countof(buf), TEXT("%d"), g_cfg.showUsage ? 1 : 0);
     WritePrivateProfileString(TEXT("view"), TEXT("ShowUsage"), buf, path);
@@ -1450,4 +1831,9 @@ static void SaveConfigToIni()
     WritePrivateProfileString(TEXT("threshold"), TEXT("Cpu"), buf, path);
     StringCchPrintf(buf, _countof(buf), TEXT("%d"), g_gpuThreshold);
     WritePrivateProfileString(TEXT("threshold"), TEXT("Gpu"), buf, path);
+
+    // Per-GPU showInPanel under stable PCI-path-derived keys. We DON'T write
+    // these here — they're written immediately on each toggle (in
+    // ShowContextMenu) so "保存配置" doesn't accidentally overwrite a fresh
+    // unsaved toggle the user just made.
 }

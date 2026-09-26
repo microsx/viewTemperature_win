@@ -4,6 +4,34 @@ A list of things that are known, intentional, or currently out of scope.
 Read this before opening an issue — if your question matches one of the
 sections below, it's probably not a bug.
 
+## Multi-GPU and integrated graphics (iGPU)
+
+- **Mixed-mode (iGPU + dGPU) is fully supported.** viewTemp enumerates every
+  GPU entry that MAHM reports (typically 2 in a hybrid-mode laptop:
+  the dGPU at index 0 and the iGPU at index 1) and renders each card as a
+  4-row block (name / temp / usage / VRAM).
+- **iGPU temperature is not available.** MAHM does not fill
+  `MAHM_SRC_GPU_TEMPERATURE` for Intel integrated graphics; the iGPU
+  temperature row will display `--`. Usage and VRAM-percentage are usually
+  populated by MAHM and are visible.
+- **VRAM total for the iGPU is not available.** DXGI reports
+  `DedicatedVideoMemory = 0` for Intel iGPUs (the iGPU shares system RAM,
+  not dedicated VRAM). When no DXGI total is found, the VRAM row shows
+  percentage only (`12.3%`) instead of `0.20G / -G (12.3%)`. This is
+  intentional — there is no public API that exposes iGPU-shared VRAM as a
+  fixed number.
+- **Per-card show/hide.** The right-click menu has one checkbox per
+  detected card (menu ID = `1015 + i`). Toggling writes the state to
+  `viewTemp.ini` under `[view] ShowGpu_<PCI-path-sans-&-and-=>=`. The
+  ini key is derived from the PCI device path (stable across reboots,
+  BIOS mode switches, and adapter reordering), so toggling a card keeps
+  working even if MAHM happens to report it at a different index on the
+  next launch.
+- **Same-vendor multi-GPU** (e.g. two NVIDIA cards) is rare in viewTemp's
+  target use case (consumer laptops / desktops). DXGI adapter matching
+  uses VendorId with "first match wins" — the second card may get the
+  first card's VRAM total until we add a better disambiguator.
+
 ## Required runtime
 
 - **MSI Afterburner must be running.** viewTemp reads sensor data from the
