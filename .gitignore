@@ -1,0 +1,30 @@
+# Build artifacts
+build/
+*.obj
+*.res
+*.pdb
+*.pch
+*.exe
+
+# Runtime / user config (never commit)
+viewTemp.log
+viewTemp.ini
+
+# Internal development notes (never commit)
+notes/
+
+# Old backups / debugging residue
+*.bak
+*.bak_*
+0.01
+1.00
+1.23
+
+# Visual Studio / IDE
+.vs/
+*.user
+*.suo
+
+# OS metadata
+Thumbs.db
+.DS_Store

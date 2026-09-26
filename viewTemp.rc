@@ -1,0 +1,42 @@
+// viewTemp.rc — version info resource only. No dialogs, no icons, no strings.
+// VERSION_MAJOR / VERSION_MINOR are injected via `rc /d VERSION_MAJOR=N /d VERSION_MINOR=N`
+// from build.bat. They are stored as hundredths of a whole number:
+//   0.01 -> MAJOR=0 MINOR=1
+//   1.00 -> MAJOR=1 MINOR=0
+//   1.23 -> MAJOR=1 MINOR=23
+// VS_VERSION_INFO requires the four-field FILEVERSION/PRODUCTVERSION shape, so we
+// map the two human fields to (MAJOR, MINOR, 0, 0). The third/fourth fields are
+// always 0; that's fine — Windows shows just MAJOR.MINOR in Properties dialog.
+
+#include <winver.h>
+
+// Stringify a numeric rc macro into a string literal: STR(VERSION_MAJOR) -> "1"
+#define STR_HELPER(x) #x
+#define STR(x)        STR_HELPER(x)
+
+#define FILE_VERSION_STRING STR(VERSION_MAJOR) "." STR(VERSION_MINOR)
+
+VS_VERSION_INFO VERSIONINFO
+FILEVERSION    VERSION_MAJOR,VERSION_MINOR,0,0
+PRODUCTVERSION VERSION_MAJOR,VERSION_MINOR,0,0
+FILEFLAGSMASK  0x3fL
+FILEFLAGS      0x0L
+FILEOS         VOS__WINDOWS32
+FILETYPE       VFT_APP
+{
+    BLOCK "StringFileInfo"
+    {
+        BLOCK "040904b0"  // US English, Unicode
+        {
+            VALUE "CompanyName",      "viewTemp"
+            VALUE "FileDescription",  "Top-most overlay for CPU/GPU temperature + VRAM"
+            VALUE "FileVersion",      FILE_VERSION_STRING
+            VALUE "ProductName",      "viewTemp"
+            VALUE "ProductVersion",   FILE_VERSION_STRING
+        }
+    }
+    BLOCK "VarFileInfo"
+    {
+        VALUE "Translation", 0x0409, 1200
+    }
+}
